@@ -12,15 +12,22 @@ class NodeStorage implements IStorage {
   }
 
   async removeItem(key: string): Promise<void> {
-    GLOBAL_STORAGE.delete(this.getKey(key));
+    const fullKey = this.getKey(key);
+    console.log(`[Storage] REMOVE ${fullKey}`);
+    GLOBAL_STORAGE.delete(fullKey);
   }
 
   async setItem(key: string, value: string): Promise<void> {
-    GLOBAL_STORAGE.set(this.getKey(key), value);
+    const fullKey = this.getKey(key);
+    console.log(`[Storage] SET ${fullKey}`);
+    GLOBAL_STORAGE.set(fullKey, value);
   }
 
   async getItem(key: string): Promise<string | null> {
-    return GLOBAL_STORAGE.get(this.getKey(key)) ?? null;
+    const fullKey = this.getKey(key);
+    const value = GLOBAL_STORAGE.get(fullKey) ?? null;
+    console.log(`[Storage] GET ${fullKey} = ${value ? 'EXISTS' : 'NULL'}`);
+    return value;
   }
 }
 
@@ -28,6 +35,10 @@ class NodeStorage implements IStorage {
 const tonConnectInstances = new Map<number, TonConnect>();
 const listenerUnsubscribers = new Map<number, () => void>();
 const connectionPollers = new Map<number, NodeJS.Timeout>();
+const connectionCallbacks = new Map<number, {
+  onConnected: (address: string) => void;
+  onDisconnected: () => void;
+}>();
 
 // Manifest URL - must be publicly accessible
 const MANIFEST_URL = process.env.TON_CONNECT_MANIFEST_URL || 'https://raw.githubusercontent.com/open4dev/open4dev-bot/main/public/tonconnect-manifest.json';
@@ -61,11 +72,14 @@ export function getTonConnectInstance(telegramId: number): TonConnect {
   let connector = tonConnectInstances.get(telegramId);
 
   if (!connector) {
+    console.log(`[getTonConnectInstance] Creating new instance for user ${telegramId}`);
     connector = new TonConnect({
       manifestUrl: MANIFEST_URL,
       storage: new NodeStorage(`user_${telegramId}`),
     });
     tonConnectInstances.set(telegramId, connector);
+  } else {
+    console.log(`[getTonConnectInstance] Reusing existing instance for user ${telegramId}`);
   }
 
   return connector;
@@ -78,10 +92,12 @@ export async function restoreConnection(telegramId: number): Promise<TonConnect>
   const connector = getTonConnectInstance(telegramId);
 
   if (!connector.connected) {
+    console.log(`[restoreConnection] Attempting to restore connection for user ${telegramId}`);
     try {
       await connector.restoreConnection();
+      console.log(`[restoreConnection] Restore result - connected: ${connector.connected}`);
     } catch (error) {
-      console.log(`[TonConnect] Restore failed for user ${telegramId}:`, error);
+      console.log(`[restoreConnection] Restore failed for user ${telegramId}:`, error);
     }
   }
 
@@ -99,39 +115,53 @@ export async function generateWalletConnection(
 ): Promise<WalletConnectionData> {
   const connector = getTonConnectInstance(telegramId);
 
-  // Cleanup existing connection
-  stopConnectionPolling(telegramId);
+  console.log(`[generateWalletConnection] Starting wallet connection for user ${telegramId}, type: ${walletType}`);
 
-  const oldUnsubscribe = listenerUnsubscribers.get(telegramId);
-  if (oldUnsubscribe) {
-    oldUnsubscribe();
-    listenerUnsubscribers.delete(telegramId);
+  // STEP 1: Clean up any existing connection and listener
+  try {
+    stopConnectionPolling(telegramId);
+
+    const oldUnsubscribe = listenerUnsubscribers.get(telegramId);
+    if (oldUnsubscribe) {
+      console.log(`[generateWalletConnection] Removing old listener for user ${telegramId}`);
+      oldUnsubscribe();
+      listenerUnsubscribers.delete(telegramId);
+    }
+
+    if (connector.connected) {
+      console.log(`[generateWalletConnection] Disconnecting existing connection for user ${telegramId}`);
+      await connector.disconnect();
+    }
+  } catch (error) {
+    console.log(`[generateWalletConnection] Cleanup error (non-critical):`, error);
   }
 
-  if (connector.connected) {
-    await connector.disconnect();
-  }
-
-  // Setup listener BEFORE connect
+  // STEP 2: Setup listener BEFORE calling connect()
+  console.log(`[generateWalletConnection] Setting up listener BEFORE connect() for user ${telegramId}`);
   setupWalletListener(telegramId, onConnected, onDisconnected);
 
-  // Get wallet config and connect
+  // STEP 3: Get wallet config and connect
   const walletConfig = WALLET_CONFIGS[walletType] || WALLET_CONFIGS['Tonkeeper'];
+
+  console.log(`[generateWalletConnection] Calling connect() for user ${telegramId} (wallet=${walletType}, manifest=${MANIFEST_URL})`);
 
   let tcLink: string;
   try {
     const linkOrPromise = connector.connect(walletConfig) as unknown;
     tcLink = typeof linkOrPromise === 'string' ? linkOrPromise : await (linkOrPromise as Promise<string>);
   } catch (error) {
-    console.error(`[TonConnect] connect() failed:`, error);
+    console.error(`[generateWalletConnection] connect() failed:`, error);
     throw error;
   }
 
-  // Start polling as fallback
+  console.log(`[generateWalletConnection] Generated TonConnect link:`, tcLink);
+
+  // STEP 4: Start polling (fallback for Node.js environments)
   startConnectionPolling(telegramId, onConnected, onDisconnected);
 
   // Convert to universal link
   const universalLink = convertToUniversalLink(tcLink, walletType);
+  console.log(`[generateWalletConnection] Universal link:`, universalLink);
 
   // Generate QR code buffer
   const qrCodeBuffer = await QRCode.toBuffer(tcLink, {
@@ -139,6 +169,8 @@ export async function generateWalletConnection(
     margin: 2,
     color: { dark: '#000000', light: '#FFFFFF' },
   });
+
+  console.log(`[generateWalletConnection] QR code generated successfully`);
 
   return { universalLink, qrCodeBuffer, tcLink };
 }
@@ -164,7 +196,7 @@ function convertToUniversalLink(tcLink: string, walletType: string): string {
 }
 
 /**
- * Setup wallet listener
+ * Setup wallet listener with error handling
  */
 function setupWalletListener(
   telegramId: number,
@@ -173,28 +205,57 @@ function setupWalletListener(
 ): void {
   const connector = getTonConnectInstance(telegramId);
 
+  console.log(`[setupWalletListener] Setting up listener for user ${telegramId}`);
+  console.log(`[setupWalletListener] Current connection status: ${connector.connected}`);
+
+  // Store callbacks for manual triggering
+  connectionCallbacks.set(telegramId, { onConnected, onDisconnected });
+
+  // Remove old listener if exists
+  const oldUnsubscribe = listenerUnsubscribers.get(telegramId);
+  if (oldUnsubscribe) {
+    console.log(`[setupWalletListener] WARNING: Old listener still exists, removing`);
+    oldUnsubscribe();
+    listenerUnsubscribers.delete(telegramId);
+  }
+
+  // Setup new listener with error handling
   const unsubscribe = connector.onStatusChange(
     (wallet) => {
-      if (wallet) {
-        stopConnectionPolling(telegramId);
-        onConnected(wallet.account.address);
-      } else {
-        stopConnectionPolling(telegramId);
-        onDisconnected();
+      console.log(`[onStatusChange] Status change triggered for user ${telegramId}`);
+      console.log(`[onStatusChange] Wallet data:`, wallet);
+
+      try {
+        if (wallet) {
+          console.log(`[onStatusChange] ✅ Wallet CONNECTED: ${wallet.account.address}`);
+          stopConnectionPolling(telegramId);
+          onConnected(wallet.account.address);
+        } else {
+          console.log(`[onStatusChange] ❌ Wallet DISCONNECTED`);
+          stopConnectionPolling(telegramId);
+          onDisconnected();
+        }
+      } catch (error) {
+        console.error(`[onStatusChange] Error in callback:`, error);
       }
     },
     (error) => {
-      console.error(`[TonConnect] Error for user ${telegramId}:`, error);
-      stopConnectionPolling(telegramId);
-      onDisconnected();
+      console.error(`[onStatusChange] TonConnect error for user ${telegramId}:`, error);
+      try {
+        stopConnectionPolling(telegramId);
+        onDisconnected();
+      } catch (err) {
+        console.error(`[onStatusChange] Error calling onDisconnected:`, err);
+      }
     }
   );
 
   listenerUnsubscribers.set(telegramId, unsubscribe);
+  console.log(`[setupWalletListener] ✅ Listener set up successfully for user ${telegramId}`);
 }
 
 /**
- * Start connection polling (fallback for Node.js)
+ * Start polling connection status (fallback for Node.js)
  */
 function startConnectionPolling(
   telegramId: number,
@@ -203,40 +264,72 @@ function startConnectionPolling(
 ): void {
   stopConnectionPolling(telegramId);
 
-  const connector = tonConnectInstances.get(telegramId);
-  if (!connector) return;
+  console.log(`[startConnectionPolling] Starting connection polling for user ${telegramId}`);
 
+  const connector = tonConnectInstances.get(telegramId);
+  if (!connector) {
+    console.log(`[startConnectionPolling] Connector not found for user ${telegramId}`);
+    return;
+  }
+
+  // Initialize lastStatus based on current state
   let lastStatus = connector.connected || !!connector.wallet;
   let pollCount = 0;
   const maxPolls = 120; // 2 minutes
 
-  const pollInterval = setInterval(() => {
+  const pollInterval = setInterval(async () => {
     pollCount++;
     const currentConnector = tonConnectInstances.get(telegramId);
+
     if (!currentConnector) {
+      console.log(`[startConnectionPolling] Connector not found, stopping poll`);
       stopConnectionPolling(telegramId);
       return;
     }
 
-    const isConnected = currentConnector.connected || !!currentConnector.wallet;
-    const address = currentConnector.account?.address || currentConnector.wallet?.account?.address;
+    try {
+      const connected = currentConnector.connected;
+      const wallet = currentConnector.wallet;
+      const account = currentConnector.account;
+      const isConnected = connected || !!wallet;
+      const currentAddress = account?.address || wallet?.account?.address;
 
-    if (isConnected && address && !lastStatus) {
-      stopConnectionPolling(telegramId);
-      onConnected(address);
-      return;
-    }
+      // Log every 10 polls for debugging
+      if (pollCount % 10 === 0) {
+        console.log(`[startConnectionPolling] Poll #${pollCount} for user ${telegramId}:`, {
+          connected,
+          hasWallet: !!wallet,
+          hasAccount: !!account,
+          address: currentAddress || 'none',
+          lastStatus,
+          isConnected,
+        });
+      }
 
-    if (!isConnected && lastStatus) {
-      stopConnectionPolling(telegramId);
-      onDisconnected();
-      return;
-    }
+      // Status changed from disconnected to connected
+      if (isConnected && currentAddress && !lastStatus) {
+        console.log(`[startConnectionPolling] ✅ Connection detected via polling: ${currentAddress}`);
+        stopConnectionPolling(telegramId);
+        onConnected(currentAddress);
+        return;
+      }
 
-    lastStatus = isConnected;
+      // Status changed from connected to disconnected
+      if (!isConnected && lastStatus) {
+        console.log(`[startConnectionPolling] ❌ Disconnection detected via polling`);
+        stopConnectionPolling(telegramId);
+        onDisconnected();
+        return;
+      }
 
-    if (pollCount >= maxPolls) {
-      stopConnectionPolling(telegramId);
+      lastStatus = isConnected;
+
+      if (pollCount >= maxPolls) {
+        console.log(`[startConnectionPolling] Max polls reached, stopping`);
+        stopConnectionPolling(telegramId);
+      }
+    } catch (error) {
+      console.error(`[startConnectionPolling] Error:`, error);
     }
   }, 1000);
 
@@ -251,6 +344,7 @@ function stopConnectionPolling(telegramId: number): void {
   if (poller) {
     clearInterval(poller);
     connectionPollers.delete(telegramId);
+    console.log(`[stopConnectionPolling] Stopped polling for user ${telegramId}`);
   }
 }
 
@@ -275,6 +369,8 @@ export function getWalletAddress(telegramId: number): string | null {
  * Disconnect wallet
  */
 export async function disconnectWallet(telegramId: number): Promise<void> {
+  console.log(`[disconnectWallet] Disconnecting user ${telegramId}`);
+
   stopConnectionPolling(telegramId);
 
   const unsubscribe = listenerUnsubscribers.get(telegramId);
@@ -282,6 +378,8 @@ export async function disconnectWallet(telegramId: number): Promise<void> {
     unsubscribe();
     listenerUnsubscribers.delete(telegramId);
   }
+
+  connectionCallbacks.delete(telegramId);
 
   const connector = tonConnectInstances.get(telegramId);
   if (connector) {
@@ -298,6 +396,8 @@ export async function disconnectWallet(telegramId: number): Promise<void> {
       GLOBAL_STORAGE.delete(key);
     }
   }
+
+  console.log(`[disconnectWallet] Cleanup complete for user ${telegramId}`);
 }
 
 /**
@@ -319,7 +419,7 @@ export async function sendTransaction(
   }
 
   const transaction = {
-    validUntil: Math.floor(Date.now() / 1000) + 600, // 10 minutes
+    validUntil: Math.floor(Date.now() / 1000) + 600,
     messages: [
       {
         address: params.address,
@@ -330,6 +430,9 @@ export async function sendTransaction(
     ],
   };
 
+  console.log(`[sendTransaction] Sending transaction for user ${telegramId}`);
   const result = await connector.sendTransaction(transaction);
+  console.log(`[sendTransaction] Transaction sent successfully`);
+
   return result.boc;
 }
