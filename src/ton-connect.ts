@@ -1,8 +1,57 @@
 import TonConnect, { IStorage, WalletConnectionSource } from '@tonconnect/sdk';
 import QRCode from 'qrcode';
+import Redis from 'ioredis';
+import { Address } from '@ton/core';
+import * as fs from 'fs';
+import * as path from 'path';
 
-// In-memory storage for TonConnect
-const GLOBAL_STORAGE = new Map<string, string>();
+// Redis client (lazy initialized)
+let redisClient: Redis | null = null;
+
+function getRedisClient(): Redis {
+  if (!redisClient) {
+    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    redisClient = new Redis(redisUrl);
+    redisClient.on('error', (err) => console.error('[Redis] Error:', err));
+    redisClient.on('connect', () => console.log('[Redis] Connected'));
+  }
+  return redisClient;
+}
+
+// File-based storage path for persistence
+const STORAGE_FILE = path.join(process.cwd(), '.tonconnect-sessions.json');
+
+// Load storage from file on startup
+function loadStorageFromFile(): Map<string, string> {
+  try {
+    if (fs.existsSync(STORAGE_FILE)) {
+      const data = fs.readFileSync(STORAGE_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      console.log(`[Storage] Loaded ${Object.keys(parsed).length} keys from file`);
+      return new Map(Object.entries(parsed));
+    }
+  } catch (error) {
+    console.error('[Storage] Error loading from file:', error);
+  }
+  return new Map();
+}
+
+// Save storage to file
+function saveStorageToFile(storage: Map<string, string>): void {
+  try {
+    const obj = Object.fromEntries(storage);
+    fs.writeFileSync(STORAGE_FILE, JSON.stringify(obj, null, 2));
+  } catch (error) {
+    console.error('[Storage] Error saving to file:', error);
+  }
+}
+
+// File-backed storage for TonConnect (persists across restarts)
+const GLOBAL_STORAGE = loadStorageFromFile();
+
+// Check if Redis should be used
+const useRedis = process.env.USE_REDIS === 'true' || !!process.env.REDIS_URL;
+console.log(`[TonConnect] Storage mode: ${useRedis ? 'Redis' : 'File'} (USE_REDIS=${process.env.USE_REDIS}, REDIS_URL=${process.env.REDIS_URL ? 'set' : 'unset'})`);
 
 class NodeStorage implements IStorage {
   constructor(private namespace: string) {}
@@ -15,12 +64,14 @@ class NodeStorage implements IStorage {
     const fullKey = this.getKey(key);
     console.log(`[Storage] REMOVE ${fullKey}`);
     GLOBAL_STORAGE.delete(fullKey);
+    saveStorageToFile(GLOBAL_STORAGE);
   }
 
   async setItem(key: string, value: string): Promise<void> {
     const fullKey = this.getKey(key);
     console.log(`[Storage] SET ${fullKey}`);
     GLOBAL_STORAGE.set(fullKey, value);
+    saveStorageToFile(GLOBAL_STORAGE);
   }
 
   async getItem(key: string): Promise<string | null> {
@@ -28,6 +79,70 @@ class NodeStorage implements IStorage {
     const value = GLOBAL_STORAGE.get(fullKey) ?? null;
     console.log(`[Storage] GET ${fullKey} = ${value ? 'EXISTS' : 'NULL'}`);
     return value;
+  }
+}
+
+class RedisStorage implements IStorage {
+  constructor(private namespace: string) {}
+
+  private getKey(key: string): string {
+    return `tonconnect:${this.namespace}:${key}`;
+  }
+
+  async removeItem(key: string): Promise<void> {
+    try {
+      const fullKey = this.getKey(key);
+      await getRedisClient().del(fullKey);
+      console.log(`[RedisStorage] REMOVE ${fullKey}`);
+    } catch (error) {
+      console.error('[RedisStorage] removeItem error:', error);
+    }
+  }
+
+  async setItem(key: string, value: string): Promise<void> {
+    try {
+      const fullKey = this.getKey(key);
+      // Store without expiration to persist sessions across restarts
+      await getRedisClient().set(fullKey, value);
+      console.log(`[RedisStorage] SET ${fullKey}`);
+    } catch (error) {
+      console.error('[RedisStorage] setItem error:', error);
+    }
+  }
+
+  async getItem(key: string): Promise<string | null> {
+    try {
+      const fullKey = this.getKey(key);
+      const value = await getRedisClient().get(fullKey);
+      console.log(`[RedisStorage] GET ${fullKey} = ${value ? 'EXISTS' : 'NULL'}`);
+      return value;
+    } catch (error) {
+      console.error('[RedisStorage] getItem error:', error);
+      return null;
+    }
+  }
+}
+
+// Create storage based on configuration
+function createStorage(telegramId: number): IStorage {
+  const namespace = `user_${telegramId}`;
+  if (useRedis) {
+    console.log(`[TonConnect] Using Redis storage for user ${telegramId}`);
+    return new RedisStorage(namespace);
+  }
+  console.log(`[TonConnect] Using file-backed storage for user ${telegramId}`);
+  return new NodeStorage(namespace);
+}
+
+/**
+ * Convert address to user-friendly bounceable format required by TonConnect SDK
+ */
+function toUserFriendlyAddress(address: string): string {
+  try {
+    const parsed = Address.parse(address);
+    return parsed.toString({ bounceable: true });
+  } catch {
+    return address;
   }
 }
 
@@ -49,18 +164,18 @@ export interface WalletConnectionData {
   tcLink: string;
 }
 
-// Wallet configurations
+// Wallet configurations (from https://github.com/ton-connect/wallets-list)
 const WALLET_CONFIGS: Record<string, WalletConnectionSource> = {
   'Tonkeeper': {
     bridgeUrl: 'https://bridge.tonapi.io/bridge',
     universalLink: 'https://app.tonkeeper.com/ton-connect',
   },
   'MyTonWallet': {
-    bridgeUrl: 'https://bridge.mytonwallet.org/bridge',
-    universalLink: 'https://connect.mytonwallet.org/ton-connect',
+    bridgeUrl: 'https://tonconnectbridge.mytonwallet.org/bridge/',
+    universalLink: 'https://connect.mytonwallet.org',
   },
   'Telegram Wallet': {
-    bridgeUrl: 'https://bridge.tonapi.io/bridge',
+    bridgeUrl: 'https://walletbot.me/tonconnect-bridge/bridge',
     universalLink: 'https://t.me/wallet?attach=wallet',
   },
 };
@@ -75,7 +190,7 @@ export function getTonConnectInstance(telegramId: number): TonConnect {
     console.log(`[getTonConnectInstance] Creating new instance for user ${telegramId}`);
     connector = new TonConnect({
       manifestUrl: MANIFEST_URL,
-      storage: new NodeStorage(`user_${telegramId}`),
+      storage: createStorage(telegramId),
     });
     tonConnectInstances.set(telegramId, connector);
   } else {
@@ -187,7 +302,7 @@ function convertToUniversalLink(tcLink: string, walletType: string): string {
     case 'Tonkeeper':
       return `https://app.tonkeeper.com/ton-connect?${params.toString()}`;
     case 'MyTonWallet':
-      return `https://connect.mytonwallet.org/ton-connect?connect=${encodeURIComponent(tcLink)}`;
+      return `https://connect.mytonwallet.org?connect=${encodeURIComponent(tcLink)}`;
     case 'Telegram Wallet':
       return `https://t.me/wallet?startattach=${encodeURIComponent(params.toString())}`;
     default:
@@ -353,16 +468,37 @@ function stopConnectionPolling(telegramId: number): void {
  */
 export function isWalletConnected(telegramId: number): boolean {
   const connector = tonConnectInstances.get(telegramId);
-  return connector ? connector.connected : false;
+  const connected = connector ? (connector.connected || !!connector.wallet) : false;
+  console.log(`[isWalletConnected] User ${telegramId}: ${connected}`);
+  return connected;
 }
 
 /**
- * Get connected wallet address
+ * Get connected wallet address (in user-friendly format)
  */
 export function getWalletAddress(telegramId: number): string | null {
   const connector = tonConnectInstances.get(telegramId);
-  if (!connector || !connector.connected) return null;
-  return connector.account?.address || null;
+  if (!connector) {
+    console.log(`[getWalletAddress] No connector for user ${telegramId}`);
+    return null;
+  }
+
+  const connected = connector.connected || !!connector.wallet;
+  if (!connected) {
+    console.log(`[getWalletAddress] User ${telegramId} not connected`);
+    return null;
+  }
+
+  const rawAddress = connector.account?.address || connector.wallet?.account?.address;
+  if (!rawAddress) {
+    console.log(`[getWalletAddress] No address found for user ${telegramId}`);
+    return null;
+  }
+
+  // Convert to user-friendly format
+  const userFriendly = toUserFriendlyAddress(rawAddress);
+  console.log(`[getWalletAddress] User ${telegramId}: ${rawAddress} -> ${userFriendly}`);
+  return userFriendly;
 }
 
 /**
@@ -418,11 +554,16 @@ export async function sendTransaction(
     throw new Error('Wallet not connected');
   }
 
+  // Convert address to user-friendly format required by TonConnect SDK
+  const formattedAddress = toUserFriendlyAddress(params.address);
+  console.log(`[sendTransaction] Original address: ${params.address}`);
+  console.log(`[sendTransaction] Formatted address: ${formattedAddress}`);
+
   const transaction = {
     validUntil: Math.floor(Date.now() / 1000) + 600,
     messages: [
       {
-        address: params.address,
+        address: formattedAddress,
         amount: params.amount,
         stateInit: params.stateInit,
         payload: params.payload,
@@ -431,6 +572,10 @@ export async function sendTransaction(
   };
 
   console.log(`[sendTransaction] Sending transaction for user ${telegramId}`);
+  console.log(`[sendTransaction] Amount: ${params.amount}`);
+  console.log(`[sendTransaction] Has stateInit: ${!!params.stateInit}`);
+  console.log(`[sendTransaction] Has payload: ${!!params.payload}`);
+
   const result = await connector.sendTransaction(transaction);
   console.log(`[sendTransaction] Transaction sent successfully`);
 

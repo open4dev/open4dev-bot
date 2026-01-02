@@ -1,5 +1,7 @@
+import 'dotenv/config'; // Must be first!
 import { Bot, Context, session, SessionFlavor, InlineKeyboard, InputFile } from 'grammy';
-import { MinterService } from './minter-service';
+import { toNano, Address } from '@ton/core';
+import { initMinter, getMinter } from './minter';
 import { calculateMintAmount } from './ton-link';
 import {
   generateWalletConnection,
@@ -9,20 +11,21 @@ import {
   sendTransaction,
   restoreConnection,
 } from './ton-connect';
-import 'dotenv/config';
 
 // Session data
 interface SessionData {
   walletAddress?: string;
   walletType?: string;
   qrMessageId?: number;
+  pendingMint?: any;
 }
 
 type BotContext = Context & SessionFlavor<SessionData>;
 
 // Config
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const MINTER_SERVICE_URL = process.env.MINTER_SERVICE_URL || 'http://localhost:3000';
+const MINTER_ADDRESS = process.env.MINTER_ADDRESS;
+const COLLECTION_ADDRESS = process.env.COLLECTION_ADDRESS;
 const DEFAULT_METADATA_URL = process.env.DEFAULT_METADATA_URL || 'https://example.com/nft/open4dev.json';
 const DEFAULT_PRICE = process.env.DEFAULT_PRICE || '0.01';
 
@@ -30,9 +33,19 @@ if (!BOT_TOKEN) {
   throw new Error('BOT_TOKEN is required');
 }
 
-// Initialize
+if (!MINTER_ADDRESS) {
+  throw new Error('MINTER_ADDRESS is required');
+}
+
+// Initialize minter service (integrated)
+initMinter({
+  minterAddress: MINTER_ADDRESS,
+  collectionAddress: COLLECTION_ADDRESS,
+  defaultPrice: toNano(DEFAULT_PRICE),
+});
+
+// Initialize bot
 const bot = new Bot<BotContext>(BOT_TOKEN);
-const minterService = new MinterService(MINTER_SERVICE_URL);
 
 // Session middleware
 bot.use(session({ initial: (): SessionData => ({}) }));
@@ -40,6 +53,16 @@ bot.use(session({ initial: (): SessionData => ({}) }));
 // Format address for display
 function formatAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+// Convert to bounceable format
+function toBounceableAddress(address: string): string {
+  try {
+    const parsed = Address.parse(address);
+    return parsed.toString({ bounceable: true });
+  } catch {
+    return address;
+  }
 }
 
 // /start command
@@ -79,10 +102,14 @@ async function showMainMenu(ctx: BotContext, address: string) {
     .text('Mint NFT', 'mint_nft').row()
     .text('Disconnect Wallet', 'disconnect_wallet');
 
+  const bounceableAddress = toBounceableAddress(address);
+
+  const totalPrice = (parseFloat(DEFAULT_PRICE) + 0.08).toFixed(2);
+
   await ctx.reply(
-    `Wallet: ${formatAddress(address)}\n\n` +
+    `💳 ${formatAddress(bounceableAddress)}\n\n` +
     `Ready to mint your Open4Dev NFT!\n\n` +
-    `Price: ${DEFAULT_PRICE} TON + ~0.08 TON gas`,
+    `💎 ~${totalPrice} TON (${DEFAULT_PRICE} + gas)`,
     { reply_markup: keyboard }
   );
 }
@@ -105,18 +132,17 @@ bot.command('help', async (ctx) => {
 
 // /status command
 bot.command('status', async (ctx) => {
-  const isHealthy = await minterService.healthCheck();
-
-  if (isHealthy) {
-    const info = await minterService.getInfo();
+  try {
+    const minter = getMinter();
+    const info = minter.getInfo();
     await ctx.reply(
       `Service Status: Online\n\n` +
-      `Minter: ${formatAddress(info.data.minterAddress)}\n` +
-      `Collection: ${formatAddress(info.data.collectionAddress)}\n` +
-      `Default Price: ${info.data.defaultPriceFormatted}`
+      `Minter: ${formatAddress(info.minterAddress)}\n` +
+      `Collection: ${info.collectionAddress ? formatAddress(info.collectionAddress) : 'N/A'}\n` +
+      `Default Price: ${info.defaultPriceFormatted}`
     );
-  } else {
-    await ctx.reply('Service Status: Offline\n\nPlease try again later.');
+  } catch (error) {
+    await ctx.reply('Service Status: Error\n\nMinter not initialized.');
   }
 });
 
@@ -293,29 +319,13 @@ bot.callbackQuery('mint_nft', async (ctx) => {
     return;
   }
 
-  // Check service health
-  const isHealthy = await minterService.healthCheck();
-  if (!isHealthy) {
-    await ctx.editMessageText('Minting service is currently offline. Please try again later.', {
-      reply_markup: new InlineKeyboard().text('Back', 'back_to_menu'),
-    });
-    return;
-  }
-
   await ctx.editMessageText('Preparing your NFT mint...');
 
   try {
-    // Get signed mint data from service
-    const mintData = await minterService.signMint(address, DEFAULT_METADATA_URL, DEFAULT_PRICE);
+    // Get signed mint data from integrated minter
+    const minter = getMinter();
+    const data = minter.signMint(address, DEFAULT_METADATA_URL, DEFAULT_PRICE);
 
-    if (!mintData.success) {
-      await ctx.editMessageText(`Error: ${mintData.error || 'Failed to prepare mint'}`, {
-        reply_markup: new InlineKeyboard().text('Try Again', 'mint_nft'),
-      });
-      return;
-    }
-
-    const { data } = mintData;
     const totalAmount = calculateMintAmount(data.price);
     const totalTon = (Number(totalAmount) / 1e9).toFixed(2);
 
@@ -325,7 +335,7 @@ bot.callbackQuery('mint_nft', async (ctx) => {
       .text('Cancel', 'back_to_menu');
 
     // Store mint data in session for confirmation
-    (ctx.session as any).pendingMint = data;
+    ctx.session.pendingMint = data;
 
     await ctx.editMessageText(
       `Ready to mint Open4Dev NFT!\n\n` +
@@ -336,9 +346,9 @@ bot.callbackQuery('mint_nft', async (ctx) => {
       `Confirm to send transaction:`,
       { reply_markup: keyboard }
     );
-  } catch (error) {
+  } catch (error: any) {
     console.error('[Bot] Mint preparation error:', error);
-    await ctx.editMessageText('An error occurred. Please try again.', {
+    await ctx.editMessageText(`Error: ${error.message || 'Failed to prepare mint'}`, {
       reply_markup: new InlineKeyboard().text('Try Again', 'mint_nft'),
     });
   }
@@ -351,7 +361,7 @@ bot.callbackQuery('confirm_mint', async (ctx) => {
   const telegramId = ctx.from?.id;
   if (!telegramId) return;
 
-  const pendingMint = (ctx.session as any).pendingMint;
+  const pendingMint = ctx.session.pendingMint;
   if (!pendingMint) {
     await ctx.editMessageText('No pending mint. Please start over.', {
       reply_markup: new InlineKeyboard().text('Mint NFT', 'mint_nft'),
@@ -375,23 +385,29 @@ bot.callbackQuery('confirm_mint', async (ctx) => {
     console.log(`[Bot] Transaction sent: ${boc.slice(0, 20)}...`);
 
     // Clear pending mint
-    (ctx.session as any).pendingMint = undefined;
+    ctx.session.pendingMint = undefined;
 
     await ctx.editMessageText(
       `Transaction sent!\n\n` +
       `Your Open4Dev NFT is being minted.\n\n` +
-      `MinterItem: ${formatAddress(pendingMint.minterItemAddress)}\n\n` +
+      `MinterItem:\n\`${pendingMint.minterItemAddress}\`\n\n` +
       `The NFT will appear in your wallet shortly.`,
-      { reply_markup: new InlineKeyboard().text('Back to Menu', 'back_to_menu') }
+      { reply_markup: new InlineKeyboard().text('Back to Menu', 'back_to_menu'), parse_mode: 'Markdown' }
     );
   } catch (error: any) {
     console.error('[Bot] Transaction error:', error);
 
     let errorMessage = 'Transaction failed.';
-    if (error.message?.includes('rejected')) {
+    const errStr = error?.message || (typeof error === 'string' ? error : JSON.stringify(error));
+
+    if (errStr?.includes('rejected') || errStr?.includes('Rejected')) {
       errorMessage = 'Transaction was rejected in wallet.';
-    } else if (error.message?.includes('not connected')) {
+    } else if (errStr?.includes('not connected') || errStr?.includes('NotConnected')) {
       errorMessage = 'Wallet disconnected. Please reconnect.';
+    } else if (errStr?.includes('timeout') || errStr?.includes('Timeout')) {
+      errorMessage = 'Transaction timed out. Please try again.';
+    } else if (errStr) {
+      errorMessage = `Error: ${errStr}`;
     }
 
     await ctx.editMessageText(`${errorMessage}\n\nPlease try again.`, {
@@ -406,7 +422,7 @@ bot.callbackQuery('back_to_menu', async (ctx) => {
   const address = ctx.session.walletAddress || getWalletAddress(ctx.from?.id || 0);
 
   // Clear pending mint
-  (ctx.session as any).pendingMint = undefined;
+  ctx.session.pendingMint = undefined;
 
   await ctx.deleteMessage();
   if (address) {
@@ -423,11 +439,11 @@ bot.catch((err) => {
 
 // Start bot
 async function main() {
-  console.log('Checking minting service...');
-  const isHealthy = await minterService.healthCheck();
-  console.log(`Minting service: ${isHealthy ? 'Online' : 'Offline'}`);
-
   console.log('Starting Open4Dev NFT Minter Bot...');
+  const minter = getMinter();
+  const info = minter.getInfo();
+  console.log(`Minter Address: ${info.minterAddress}`);
+  console.log(`Default Price: ${info.defaultPriceFormatted}`);
   await bot.start();
 }
 
