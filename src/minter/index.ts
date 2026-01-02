@@ -65,8 +65,8 @@ export interface SignedNFTData {
 }
 
 export function createNftContent(metadataUrl: string): Cell {
+  // Don't include 0x01 prefix - the collection's get_nft_content adds it via OffchainMetadataReply
   return beginCell()
-    .storeUint(0x01, 8)
     .storeStringTail(metadataUrl)
     .endCell();
 }
