@@ -27,6 +27,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const MINTER_ADDRESS = process.env.MINTER_ADDRESS;
 const COLLECTION_ADDRESS = process.env.COLLECTION_ADDRESS;
 const DEFAULT_METADATA_URL = process.env.DEFAULT_METADATA_URL || 'https://example.com/nft/open4dev.json';
+const DEFAULT_METADATA_URL_2 = process.env.DEFAULT_METADATA_URL_2 || 'https://raw.githubusercontent.com/open4dev/open4dev-bot/main/public/nft2.json';
 const DEFAULT_PRICE = process.env.DEFAULT_PRICE || '0.01';
 
 if (!BOT_TOKEN) {
@@ -99,7 +100,7 @@ async function showWelcome(ctx: BotContext) {
 // Show main menu (wallet connected)
 async function showMainMenu(ctx: BotContext, address: string) {
   const keyboard = new InlineKeyboard()
-    .text('Mint NFT', 'mint_nft').row()
+    .text('🟣 Style 1', 'mint_nft').text('🔵 Style 2', 'mint_nft_2').row()
     .text('Disconnect Wallet', 'disconnect_wallet');
 
   const bounceableAddress = toBounceableAddress(address);
@@ -301,10 +302,8 @@ bot.callbackQuery('cancel_disconnect', async (ctx) => {
   }
 });
 
-// Mint NFT
-bot.callbackQuery('mint_nft', async (ctx) => {
-  await ctx.answerCallbackQuery();
-
+// Mint NFT helper function
+async function handleMint(ctx: BotContext, metadataUrl: string, styleName: string) {
   const telegramId = ctx.from?.id;
   if (!telegramId) return;
 
@@ -324,7 +323,7 @@ bot.callbackQuery('mint_nft', async (ctx) => {
   try {
     // Get signed mint data from integrated minter
     const minter = getMinter();
-    const data = minter.signMint(address, DEFAULT_METADATA_URL, DEFAULT_PRICE);
+    const data = minter.signMint(address, metadataUrl, DEFAULT_PRICE);
 
     const totalAmount = calculateMintAmount(data.price);
     const totalTon = (Number(totalAmount) / 1e9).toFixed(2);
@@ -338,20 +337,31 @@ bot.callbackQuery('mint_nft', async (ctx) => {
     ctx.session.pendingMint = data;
 
     await ctx.editMessageText(
-      `Ready to mint Open4Dev NFT!\n\n` +
+      `Ready to mint Open4Dev NFT (${styleName})!\n\n` +
       `Price: ${data.priceFormatted}\n` +
       `Gas: ~0.08 TON\n` +
       `Total: ~${totalTon} TON\n\n` +
-      `MinterItem: ${formatAddress(data.minterItemAddress)}\n\n` +
       `Confirm to send transaction:`,
       { reply_markup: keyboard }
     );
   } catch (error: any) {
     console.error('[Bot] Mint preparation error:', error);
     await ctx.editMessageText(`Error: ${error.message || 'Failed to prepare mint'}`, {
-      reply_markup: new InlineKeyboard().text('Try Again', 'mint_nft'),
+      reply_markup: new InlineKeyboard().text('Try Again', 'back_to_menu'),
     });
   }
+}
+
+// Mint NFT Style 1
+bot.callbackQuery('mint_nft', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await handleMint(ctx, DEFAULT_METADATA_URL, 'Style 1');
+});
+
+// Mint NFT Style 2
+bot.callbackQuery('mint_nft_2', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await handleMint(ctx, DEFAULT_METADATA_URL_2, 'Style 2');
 });
 
 // Confirm mint - send transaction via TonConnect
